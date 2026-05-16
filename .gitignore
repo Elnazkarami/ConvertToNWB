@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local scratch files for GitHub issue/PR bodies
+.github-issue.md
+.github-pr.md
