@@ -1,28 +1,23 @@
 
 import os
+import math
 import warnings
 import subprocess
-import math
 from datetime import datetime
-import pytz
-import pandas as pd
-import pynapple as nap
-from matplotlib.pyplot import *
-import scipy.io as spio
 from pathlib import Path
-from pynwb import NWBFile
-from pynwb import NWBHDF5IO
-from pynwb.file import Subject
-from pynwb.epoch import TimeIntervals
-from pynwb.behavior import Position
-from pynwb.behavior import CompassDirection
-from pynwb.ecephys import TimeSeries
-from pynwb.ecephys import ElectricalSeries
-from pynwb.ecephys import LFP
-from pynwb.ogen import OptogeneticSeries
-from pynwb.ogen import OptogeneticStimulusSite
+
+import numpy as np
+import pandas as pd
+import pytz
+import pynapple as nap
+import scipy.io as spio
 from hdmf.backends.hdf5.h5_utils import H5DataIO
-from pynwb.behavior import SpatialSeries
+from pynwb import NWBFile, NWBHDF5IO
+from pynwb.behavior import CompassDirection, Position, SpatialSeries
+from pynwb.ecephys import ElectricalSeries, LFP, TimeSeries
+from pynwb.epoch import TimeIntervals
+from pynwb.file import Subject
+from pynwb.ogen import OptogeneticSeries, OptogeneticStimulusSite
 
 
 # TO DO:
@@ -36,87 +31,90 @@ from pynwb.behavior import SpatialSeries
 # doc: https://nwb-overview.readthedocs.io/
 
 
-addRaw = False
-removeNWB = True  # False to skip NWBs already present, True to overwrite
+ADD_RAW = False
+OVERWRITE_EXISTING = True  # False to skip NWBs already present, True to overwrite
 
-datapath = Path('/Volumes/Extreme SSD/Dataset_Main_PoSub')
-dandipath = datapath / 'NWB' / '000939'
-os.chdir(datapath)
+DATAPATH = Path('/Volumes/Extreme SSD/Dataset_Main_PoSub')
+DANDIPATH = DATAPATH / 'NWB' / '000939'
+METADATA_FILENAME = 'Dataset_metadata.xlsx'
 
-# read metadata to get the number of folders
-print('Reading metadata from the xml file... ')
-metaname = 'Dataset_metadata.xlsx'
-metadata_full = pd.read_excel(datapath / metaname)
-totFolders = len(metadata_full)
-folder_ids = range(totFolders)
+
+def _get_meta(metadata, key, default=None):
+    """Return metadata[key] if present and not NaN, otherwise default.
+
+    Lets the metadata spreadsheet grow new columns without breaking older
+    sessions that don't have them.
+    """
+    if key not in metadata.index:
+        return default
+    val = metadata[key]
+    if isinstance(val, float) and math.isnan(val):
+        return default
+    return val
+
 
 def main():
-    for nfolder in folder_ids:
+    print('Reading metadata from the Excel file...')
+    metadata_full = pd.read_excel(DATAPATH / METADATA_FILENAME)
 
-        foldername = metadata_full.iloc[nfolder]
-        foldername = foldername['Recording']
-        print('Converting folder ' + foldername + '')
+    for nfolder in range(len(metadata_full)):
+        foldername = metadata_full.iloc[nfolder]['Recording']
+        print(f'Converting folder {foldername}')
 
-        make_nwb(nfolder)
-        organize_nwb(nfolder)
+        make_nwb(metadata_full, nfolder)
+        organize_nwb(metadata_full, nfolder)
 
-def organize_nwb(rec_number):
-
-    # first run nwbinspector
-    os.chdir(datapath)
+def organize_nwb(metadata_full, rec_number):
     metadata = metadata_full.iloc[rec_number]
     foldername = metadata['Recording']
-    path = datapath / foldername
-    filename = foldername + '.nwb'
+    session_path = DATAPATH / foldername
 
-    # first run nwbinspector
     print('Inspecting NWB file...')
-    command = ['nwbinspector', foldername,  '--config', 'dandi']
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return
-
-    if 'Found 0 issues' not in result.stdout:
+    result = subprocess.run(
+        ['nwbinspector', foldername, '--config', 'dandi'],
+        capture_output=True, text=True, cwd=DATAPATH,
+    )
+    if result.returncode != 0 or 'Found 0 issues' not in result.stdout:
         print('INSPECTION FAILED :(')
-        return
-    
-    # now organize the NWB file into the
-    print('Moving to dandiset...')
-    os.chdir(dandipath)
-    command = ['dandi', 'organize', str(path)]
-
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
         print(result.stdout)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        if result.stderr:
+            print(result.stderr)
         return
-        
+
+    print('Moving to dandiset...')
+    result = subprocess.run(
+        ['dandi', 'organize', str(session_path)],
+        capture_output=True, text=True, cwd=DANDIPATH,
+    )
+    print(result.stdout)
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr)
+        return
+
     print('Done!')
 
 
-def make_nwb(rec_number):
+def make_nwb(metadata_full, rec_number):
 
     # pick correct metadata
     metadata = metadata_full.iloc[rec_number]
     foldername = metadata['Recording']
-    path = datapath / foldername / 'Data'
+    path = DATAPATH / foldername / 'Data'
 
     # remove or skip NWB file if one is present in folder
-    nwbpath = datapath / foldername / str(foldername + '.nwb')
-    if os.path.exists(str(nwbpath)):
-        if removeNWB:
-            os.remove(nwbpath)
+    nwbpath = DATAPATH / foldername / f'{foldername}.nwb'
+    if nwbpath.exists():
+        if OVERWRITE_EXISTING:
+            nwbpath.unlink()
             print('Old NWB file removed')
         else:
             return
 
-    # get info from folder name
+    # get info from folder name (expected format: <subject_id>-YYMMDD-...)
     fileInfo = foldername.split('-')
-    start_time = datetime(int(('20' + fileInfo[1][0:2])), int((fileInfo[1][2:4])), int((fileInfo[1][4:6])))
-    start_time = pytz.timezone('America/New_York').localize(start_time)
+    start_time = datetime.strptime(fileInfo[1], '%y%m%d')
+    start_time = pytz.timezone('America/Toronto').localize(start_time)
 
     # create an nwb file
     print('Creating NWB file and adding metadata...')
@@ -135,12 +133,14 @@ def make_nwb(rec_number):
 
     )
 
-   # add subject
-    nwbfile.subject = Subject(age='P12W/',
-                              description=metadata['Mouse_line'],
-                              species='Mus musculus',
-                              subject_id=fileInfo[0],
-                              sex='M')
+    # add subject (age/sex come from metadata if present)
+    nwbfile.subject = Subject(
+        age=_get_meta(metadata, 'Age', default='P12W'),
+        description=metadata['Mouse_line'],
+        species='Mus musculus',
+        subject_id=fileInfo[0],
+        sex=_get_meta(metadata, 'Sex', default='M'),
+    )
 
 
     # Load tracking, epochs and spikes
@@ -148,7 +148,7 @@ def make_nwb(rec_number):
     pos, ang, epochs, spikes, shank_id, waveforms, maxIx, tr2pk = import_session(path)
 
     # loading channel order and good channels
-    chanmap_file = datapath / foldername / 'ChannelMap.mat'
+    chanmap_file = DATAPATH / foldername / 'ChannelMap.mat'
     chanmap = spio.loadmat(chanmap_file, simplify_cells=True)
     chanOrder = chanmap['chanOrder']
     goodChans = chanmap['goodChans'].astype(bool)
@@ -166,14 +166,17 @@ def make_nwb(rec_number):
 
     # EPOCHS
     print('Adding epochs and behavioural variables...')
-    nwbfile.add_epoch(start_time=epochs['Start'][0], stop_time=epochs['End'][0], tags=metadata['Epoch_1'])
-    nwbfile.add_epoch(start_time=epochs['Start'][1], stop_time=epochs['End'][1], tags=metadata['Epoch_2'])
-    if not isinstance(metadata['Epoch_3'], float):
-        nwbfile.add_epoch(start_time=epochs['Start'][2], stop_time=epochs['End'][2], tags=metadata['Epoch_3'])
-    if not isinstance(metadata['Epoch_3'], float):
-        nwbfile.add_epoch(start_time=epochs['Start'][3], stop_time=epochs['End'][3], tags=metadata['Epoch_4'])
+    for epoch_idx, epoch_key in enumerate(['Epoch_1', 'Epoch_2', 'Epoch_3', 'Epoch_4']):
+        tag = _get_meta(metadata, epoch_key)
+        if tag is None or epoch_idx >= len(epochs):
+            continue
+        nwbfile.add_epoch(
+            start_time=epochs['Start'][epoch_idx],
+            stop_time=epochs['End'][epoch_idx],
+            tags=tag,
+        )
 
-    sleep_file = datapath/foldername/'Sleep'/(foldername + '.SleepState.states.mat')
+    sleep_file = DATAPATH/foldername/'Sleep'/(foldername + '.SleepState.states.mat')
     sleepEpochs = spio.loadmat(sleep_file, simplify_cells=True)
     epWake = np.float32(sleepEpochs['SleepState']['ints']['WAKEstate'])
     epNREM = np.float32(sleepEpochs['SleepState']['ints']['NREMstate'])
@@ -224,7 +227,7 @@ def make_nwb(rec_number):
     behavior_module.add(direction_obj)
 
     # ACCELEROMETER
-    acc_file = datapath / foldername / (foldername + '_auxiliary.dat')
+    acc_file = DATAPATH / foldername / (foldername + '_auxiliary.dat')
     if os.path.exists(acc_file):
         print('Adding accelerometer data...')
         acc_data = nap.load_eeg(filepath=acc_file, channel=None, n_channels=3, frequency=20000, precision='int16',
@@ -246,38 +249,45 @@ def make_nwb(rec_number):
     ### EPHYS ###
 
     print('Adding electrodes...')
-    # set up shank(s)
     nwbfile.add_electrode_column(name='label', description='label of electrode')
     nwbfile.add_electrode_column(name='is_faulty', description='Boolean column to indicate faulty electrodes')
     step = 12.5  # difference in spacing between electrodes
 
-    n_shanks = 1
-    n_channels = 64
+    # Derive geometry/sample rates from the channel map and metadata so the
+    # script works on recordings with different probe / acquisition configs.
+    n_channels = int(len(chanOrder))
+    n_shanks = int(_get_meta(metadata, 'N_shanks', default=1))
+    raw_rate = float(_get_meta(metadata, 'Raw_sample_rate', default=20000.0))
+    lfp_rate = float(_get_meta(metadata, 'LFP_sample_rate', default=1250.0))
+    if n_channels % n_shanks != 0:
+        raise ValueError(
+            f'n_channels ({n_channels}) is not divisible by n_shanks ({n_shanks})'
+        )
+    channels_per_shank = n_channels // n_shanks
 
-    electrode_counter = 0
     device = nwbfile.create_device(
         name='Cambridge Neurotech H5 probe',
         description=metadata['Probe_description']
     )
 
+    electrode_counter = 0
     for ishank in range(n_shanks):
-        #create an electrode group for this shank
         electrode_group = nwbfile.create_electrode_group(
-            name='shank{}'.format(ishank),
-            description='electrode group for shank{}'.format(ishank),
+            name=f'shank{ishank}',
+            description=f'electrode group for shank{ishank}',
             device=device,
             location='Postsubiculum (left hemisphere)',
         )
 
-        for ielec in range(n_channels):
-            elec_depth = step * (n_channels - ielec-1)
+        for ielec in range(channels_per_shank):
+            elec_depth = step * (channels_per_shank - ielec - 1)
             nwbfile.add_electrode(
-                x=0., y=elec_depth, z=0.,  # add electrode position
+                x=0., y=elec_depth, z=0.,
                 location='Postsubiculum (left hemisphere)',
                 filtering='none',
-                is_faulty=isFaulty[electrode_counter],
+                is_faulty=bool(isFaulty[electrode_counter]),
                 group=electrode_group,
-                label='shank{}elec{}'.format(ishank,ielec)
+                label=f'shank{ishank}elec{ielec}',
             )
             electrode_counter += 1
 
@@ -288,19 +298,19 @@ def make_nwb(rec_number):
     )
 
     # RAW DAT FILE
-    if addRaw:
+    if ADD_RAW:
         print('Adding raw dat file (may take a wee while)...')
-        path_raw = datapath / foldername / (foldername + '.dat')
-        raw_data = nap.load_eeg(filepath=path_raw, channel=None, n_channels=64, frequency=20000.0, precision='int16',
-                                bytes_size=2)
+        path_raw = DATAPATH / foldername / (foldername + '.dat')
+        raw_data = nap.load_eeg(filepath=path_raw, channel=None, n_channels=n_channels,
+                                frequency=raw_rate, precision='int16', bytes_size=2)
         raw_data = raw_data[:, chanOrder]  # sort according to channel order
 
         raw_electrical_series = ElectricalSeries(
             name="ElectricalSeries",
-            data=H5DataIO(raw_data, compression=True),  # use this function to compress
+            data=H5DataIO(raw_data, compression=True),
             electrodes=all_table_region,
-            starting_time=0.0,  # timestamp of the first sample in seconds relative to the session start time
-            rate=20000.0,  # in Hz
+            starting_time=0.0,
+            rate=raw_rate,
         )
 
         nwbfile.add_acquisition(raw_electrical_series)
@@ -308,29 +318,28 @@ def make_nwb(rec_number):
     # LFP
     print('Adding lfp...')
 
-    path_lfp = datapath / foldername / (foldername + '.lfp')
-    lfp_data = nap.load_eeg(filepath=path_lfp, channel=None, n_channels=64, frequency=1250.0, precision='int16',
-                       bytes_size=2)
+    path_lfp = DATAPATH / foldername / (foldername + '.lfp')
+    lfp_data = nap.load_eeg(filepath=path_lfp, channel=None, n_channels=n_channels,
+                            frequency=lfp_rate, precision='int16', bytes_size=2)
     lfp_data = lfp_data[:, chanOrder]  # sort according to channel order
 
-
-    # create ElectricalSeries
     lfp_elec_series = ElectricalSeries(
         name='LFP',
-        data=H5DataIO(lfp_data, compression=True),  # use this function to compress
+        data=H5DataIO(lfp_data, compression=True),
         description='Local field potential (low-pass filtered at 625 Hz)',
         electrodes=all_table_region,
-        rate=1250.
+        rate=lfp_rate,
     )
 
-    # store ElectricalSeries in an LFP container
-    warnings.filterwarnings("ignore", message=".*DynamicTableRegion.*")  # this is to supress a warning here that doesn't seem cause any issues
-    lfp = LFP(electrical_series=lfp_elec_series)
-    warnings.resetwarnings()
+    # Scope the warning suppression so we don't clobber other filters.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*DynamicTableRegion.*")
+        lfp = LFP(electrical_series=lfp_elec_series)
 
-    ecephys_module = nwbfile.create_processing_module(name='ecephys',
-                                                      description='Processed electrophysiological signals'
-                                                      )
+    ecephys_module = nwbfile.create_processing_module(
+        name='ecephys',
+        description='Processed electrophysiological signals',
+    )
     ecephys_module.add(lfp)
 
     # UNITS
@@ -348,19 +357,29 @@ def make_nwb(rec_number):
     isEX = celltypes['ex']
     isFS = celltypes['fs']
 
+    # shank_id is 1-indexed in MATLAB; maxIx is also 1-indexed and waveforms
+    # are stored as (channels, samples) and need transposing to NWB's
+    # (samples, channels) convention.
+    shank_id_arr = np.atleast_1d(shank_id).astype(int)
     for ncell in range(len(spikes)):
-        nwbfile.add_unit(spike_times=spikes[ncell].times(),
-                         electrode_index=maxIx[ncell]-1,
-                         waveform_mean=waveforms[ncell].T,
-                         trough_to_peak=tr2pk[ncell],
-                         is_excitatory=isEX[ncell],
-                         is_fast_spiking=isFS[ncell],
-                         is_head_direction=isHD[ncell],
-                         electrode_group=nwbfile.electrode_groups['shank0'])
+        unit_shank = int(shank_id_arr[ncell]) - 1 if shank_id_arr.size else 0
+        group_name = f'shank{unit_shank}'
+        if group_name not in nwbfile.electrode_groups:
+            group_name = 'shank0'  # fall back if cluster shank > probe shanks
+        nwbfile.add_unit(
+            spike_times=spikes[ncell].times(),
+            electrode_index=int(maxIx[ncell]) - 1,
+            waveform_mean=waveforms[ncell].T,
+            trough_to_peak=tr2pk[ncell],
+            is_excitatory=isEX[ncell],
+            is_fast_spiking=isFS[ncell],
+            is_head_direction=isHD[ncell],
+            electrode_group=nwbfile.electrode_groups[group_name],
+        )
 
     # EMG
     print('Adding emg...')
-    emg_file = datapath / foldername / 'Sleep' / (foldername + '.EMGFromLFP.LFP.mat')
+    emg_file = DATAPATH / foldername / 'Sleep' / (foldername + '.EMGFromLFP.LFP.mat')
     emg = spio.loadmat(emg_file, simplify_cells=True)
     emg = emg['EMGFromLFP']['data']
 
@@ -376,7 +395,7 @@ def make_nwb(rec_number):
     ecephys_module.add(emg)
 
     # OPTO
-    opto_file = datapath / foldername / 'Opto_digitalin.dat'
+    opto_file = DATAPATH / foldername / 'Opto_digitalin.dat'
     if os.path.exists(opto_file):
         print('Adding optogenetic series...')
         opto_device = nwbfile.create_device(
@@ -416,7 +435,7 @@ def make_nwb(rec_number):
     # save NWB file
     print('Saving NWB file...')
 
-    with NWBHDF5IO(datapath/foldername/(foldername + '.nwb'), 'w') as io:
+    with NWBHDF5IO(DATAPATH/foldername/(foldername + '.nwb'), 'w') as io:
         io.write(nwbfile)
 
     print('Done!')
@@ -449,19 +468,12 @@ def import_session(path):
     pos['Y'] = pos_data['pos']['data'][:, 1]
     pos.index = pos_data['pos']['t']
 
-    # Next lines load the spike data from the .mat file
+    # Load spike timestamps per cell
     spikedata = spio.loadmat(spike_file, simplify_cells=True)
-    total_cells = np.arange(0, len(spikedata['S']['C']))  # To find the total number of cells in the recording
-    spikes = dict()  # For pynapple, this will be turned into a TsGroup of all cells' timestamps
-    cell_df = pd.DataFrame(columns=['timestamps'])  # Dataframe for cells and their spike timestamps
-    # Loop to assign cell timestamps into the dataframe and the cell_ts dictionary
-    for cell in total_cells:  # give spikes
-        timestamps = spikedata['S']['C'][cell]['tsd']['t']
-        cell_df.loc[cell, 'timestamps'] = timestamps
-        temp = {cell: nap.Ts(timestamps)}
-        spikes.update(temp)
-
-   # get shank and channel ID for cells
+    spikes = {
+        cell: nap.Ts(spikedata['S']['C'][cell]['tsd']['t'])
+        for cell in range(len(spikedata['S']['C']))
+    }
     shank_id = spikedata['shank']
 
     # get waveforms and waveform features
